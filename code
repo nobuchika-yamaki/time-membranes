@@ -1,0 +1,900 @@
+import os
+import math
+import json
+import time
+from dataclasses import dataclass, asdict, replace
+from typing import Dict, List, Tuple, Optional
+
+import numpy as np
+import pandas as pd
+
+
+# =========================================================
+# Paths / logging
+# =========================================================
+
+def get_desktop_dir() -> str:
+    home = os.path.expanduser("~")
+    desktop = os.path.join(home, "Desktop")
+    return desktop if os.path.isdir(desktop) else home
+
+
+OUTDIR = os.path.join(get_desktop_dir(), "review_submission_temporal_retention_outputs")
+os.makedirs(OUTDIR, exist_ok=True)
+
+LOGFILE = os.path.join(OUTDIR, "run_log.txt")
+
+
+def log(msg: str) -> None:
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] {msg}"
+    print(line, flush=True)
+    with open(LOGFILE, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+
+# =========================================================
+# Helpers
+# =========================================================
+
+def sem(x: np.ndarray) -> float:
+    x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
+    if x.size <= 1:
+        return np.nan
+    return float(np.std(x, ddof=1) / math.sqrt(x.size))
+
+
+def safe_mean(x: np.ndarray) -> float:
+    x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
+    return float(np.mean(x)) if x.size else np.nan
+
+
+def safe_median(x: np.ndarray) -> float:
+    x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
+    return float(np.median(x)) if x.size else np.nan
+
+
+def safe_std(x: np.ndarray) -> float:
+    x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
+    return float(np.std(x, ddof=1)) if x.size > 1 else np.nan
+
+
+def fisher_ci(r: float, n: int, zcrit: float = 1.959963984540054) -> Tuple[float, float]:
+    if n < 4 or not np.isfinite(r) or abs(r) >= 1:
+        return np.nan, np.nan
+    z = 0.5 * np.log((1.0 + r) / (1.0 - r))
+    se = 1.0 / math.sqrt(n - 3)
+    lo = z - zcrit * se
+    hi = z + zcrit * se
+    r_lo = (np.exp(2 * lo) - 1) / (np.exp(2 * lo) + 1)
+    r_hi = (np.exp(2 * hi) - 1) / (np.exp(2 * hi) + 1)
+    return float(r_lo), float(r_hi)
+
+
+def save_csv(df: pd.DataFrame, filename: str) -> str:
+    path = os.path.join(OUTDIR, filename)
+    df.to_csv(path, index=False)
+    return path
+
+
+def save_json(obj: Dict, filename: str) -> str:
+    path = os.path.join(OUTDIR, filename)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
+    return path
+
+
+# =========================================================
+# Parameters
+# =========================================================
+
+@dataclass
+class SimParams:
+    gamma: float = 1.0
+    beta: float = 1.2
+    tau: float = 1.2
+    sigma: float = 0.35
+
+    # control modes:
+    # nonlinear_delay = beta * tanh(x(t-tau))
+    # bounded_linear_delay = beta * tanh(k_linear * x(t-tau))
+    # no_delay = beta * tanh(x(t))
+    control_mode: str = "nonlinear_delay"
+
+    # delay modes:
+    # fixed = single fixed delay
+    # stochastic_single_delay = one delay sampled each update
+    delay_mode: str = "fixed"
+    relative_spread: float = 0.0
+
+    # bounded-linear scaling inside tanh
+    k_linear: float = 1.0
+
+    # simulation controls
+    n_trials: int = 50
+    relax_over_gamma: float = 100.0
+    analysis_time: float = 200.0
+    seed: int = 12345
+    x_clip: float = 1e6
+
+    # sweep grids
+    tau_values: Tuple[float, ...] = (
+        0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90,
+        1.00, 1.10, 1.20, 1.35, 1.50, 1.70, 1.85, 2.00
+    )
+    beta_values: Tuple[float, ...] = (
+        0.70, 0.80, 0.90, 1.00, 1.10, 1.20, 1.40, 1.60, 1.80, 2.00
+    )
+    sigma_values: Tuple[float, ...] = (
+        0.10, 0.20, 0.30, 0.35, 0.40, 0.50, 0.70, 1.00
+    )
+    relative_spread_values: Tuple[float, ...] = (
+        0.00, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.50
+    )
+
+    def dt(self) -> float:
+        return 0.01 * min(float(self.tau), 1.0 / float(self.gamma))
+
+    def relax_time(self) -> float:
+        return self.relax_over_gamma / self.gamma
+
+    def to_serializable_dict(self) -> Dict:
+        d = asdict(self)
+        d["tau_values"] = list(self.tau_values)
+        d["beta_values"] = list(self.beta_values)
+        d["sigma_values"] = list(self.sigma_values)
+        d["relative_spread_values"] = list(self.relative_spread_values)
+        return d
+
+
+# =========================================================
+# Core model
+# =========================================================
+
+def make_initial_history(n_hist: int, sigma: float, rng: np.random.Generator) -> np.ndarray:
+    return rng.normal(loc=0.0, scale=sigma, size=n_hist)
+
+
+def sample_delay_steps(
+    delay_mode: str,
+    tau_mean: float,
+    relative_spread: float,
+    dt: float,
+    rng: np.random.Generator
+) -> int:
+    if delay_mode == "fixed":
+        tau_eff = tau_mean
+    elif delay_mode == "stochastic_single_delay":
+        if relative_spread <= 0.0:
+            tau_eff = tau_mean
+        else:
+            sd = relative_spread * tau_mean
+            tau_eff = None
+            for _ in range(1000):
+                draw = rng.normal(loc=tau_mean, scale=sd)
+                if draw > dt:
+                    tau_eff = float(draw)
+                    break
+            if tau_eff is None:
+                tau_eff = max(dt, tau_mean)
+    else:
+        raise ValueError(f"Unknown delay_mode: {delay_mode}")
+
+    return max(1, int(round(tau_eff / dt)))
+
+
+def feedback_value(
+    control_mode: str,
+    beta: float,
+    x_now: float,
+    x_delay: float,
+    k_linear: float
+) -> float:
+    if control_mode == "nonlinear_delay":
+        return beta * math.tanh(x_delay)
+    if control_mode == "bounded_linear_delay":
+        return beta * math.tanh(k_linear * x_delay)
+    if control_mode == "no_delay":
+        return beta * math.tanh(x_now)
+    raise ValueError(f"Unknown control_mode: {control_mode}")
+
+
+def autocorrelation_full_fft(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=float)
+    x = x - np.mean(x)
+    denom = np.dot(x, x)
+    if denom <= 0:
+        return np.array([np.nan], dtype=float)
+
+    n = x.size
+    nfft = 1 << (2 * n - 1).bit_length()
+    fx = np.fft.rfft(x, n=nfft)
+    acf = np.fft.irfft(fx * np.conjugate(fx), n=nfft)[:n]
+    acf = acf / acf[0]
+    return acf
+
+
+def correlation_decay_time_1e(x: np.ndarray, dt: float) -> Tuple[float, str]:
+    acf = autocorrelation_full_fft(x)
+    if acf.size == 1 and np.isnan(acf[0]):
+        return np.nan, "zero_variance"
+
+    threshold = math.e ** (-1)
+    below = np.where(acf <= threshold)[0]
+    if below.size == 0:
+        return np.nan, "never_crossed_1_over_e"
+
+    k = int(below[0])
+    if k == 0:
+        return 0.0, "crossed_at_zero"
+
+    y0 = acf[k - 1]
+    y1 = acf[k]
+    if not (np.isfinite(y0) and np.isfinite(y1)):
+        return np.nan, "nonfinite_acf"
+
+    if y1 == y0:
+        lag = float(k)
+    else:
+        frac = (threshold - y0) / (y1 - y0)
+        lag = (k - 1) + frac
+
+    return float(lag * dt), "ok"
+
+
+def autocorr_at_lag(x: np.ndarray, lag_steps: int) -> float:
+    x = np.asarray(x, dtype=float)
+    x = x - np.mean(x)
+    if lag_steps <= 0 or lag_steps >= x.size:
+        return np.nan
+    x0 = x[:-lag_steps]
+    x1 = x[lag_steps:]
+    denom = np.sqrt(np.dot(x0, x0) * np.dot(x1, x1))
+    if denom <= 0:
+        return np.nan
+    return float(np.dot(x0, x1) / denom)
+
+
+def lagged_mutual_information_binned(x: np.ndarray, lag_steps: int, n_bins: int = 32) -> float:
+    x = np.asarray(x, dtype=float)
+    if lag_steps <= 0 or lag_steps >= x.size:
+        return np.nan
+
+    a = x[:-lag_steps]
+    b = x[lag_steps:]
+
+    try:
+        hist2d, _, _ = np.histogram2d(a, b, bins=n_bins)
+        total = np.sum(hist2d)
+        if total <= 0:
+            return np.nan
+        pxy = hist2d / total
+        px = np.sum(pxy, axis=1, keepdims=True)
+        py = np.sum(pxy, axis=0, keepdims=True)
+        expected = px @ py
+        nz = pxy > 0
+        mi = np.sum(pxy[nz] * np.log(pxy[nz] / expected[nz]))
+        return float(mi)
+    except Exception:
+        return np.nan
+
+
+def simulate_single_trial(p: SimParams, rng: np.random.Generator) -> Dict[str, object]:
+    if p.gamma <= 0:
+        raise ValueError("gamma must be > 0")
+    if p.tau <= 0:
+        raise ValueError("tau must be > 0")
+    if p.beta < 0:
+        raise ValueError("beta must be >= 0")
+    if p.sigma < 0:
+        raise ValueError("sigma must be >= 0")
+    if p.relative_spread < 0:
+        raise ValueError("relative_spread must be >= 0")
+
+    dt = p.dt()
+    tau_steps_nominal = max(1, int(round(p.tau / dt)))
+    n_hist = tau_steps_nominal + 10
+
+    relax_steps = int(math.ceil(p.relax_time() / dt))
+    analysis_steps = int(math.ceil(p.analysis_time / dt))
+    total_steps = relax_steps + analysis_steps
+
+    history = make_initial_history(n_hist=n_hist, sigma=p.sigma, rng=rng)
+    x = np.empty(n_hist + total_steps, dtype=float)
+    x[:n_hist] = history
+
+    sqrt_dt = math.sqrt(dt)
+    clipped_steps = 0
+
+    for i in range(n_hist, n_hist + total_steps):
+        d_steps = sample_delay_steps(
+            delay_mode=p.delay_mode,
+            tau_mean=p.tau,
+            relative_spread=p.relative_spread,
+            dt=dt,
+            rng=rng
+        )
+
+        x_prev = x[i - 1]
+        x_delay = x[i - d_steps]
+
+        fb = feedback_value(
+            control_mode=p.control_mode,
+            beta=p.beta,
+            x_now=x_prev,
+            x_delay=x_delay,
+            k_linear=p.k_linear
+        )
+
+        drift = -p.gamma * x_prev + fb
+        diffusion = p.sigma * sqrt_dt * rng.normal()
+        x_new = x_prev + drift * dt + diffusion
+
+        if abs(x_new) > p.x_clip:
+            x_new = math.copysign(p.x_clip, x_new)
+            clipped_steps += 1
+
+        x[i] = x_new
+
+    analysis = x[n_hist + relax_steps:n_hist + relax_steps + analysis_steps].copy()
+
+    t_corr, acf_reason = correlation_decay_time_1e(analysis, dt)
+    chi = np.nan if not np.isfinite(t_corr) else p.gamma * t_corr
+
+    lag_tau_steps = max(1, int(round(p.tau / dt)))
+    mi_lag_tau = lagged_mutual_information_binned(analysis, lag_steps=lag_tau_steps, n_bins=32)
+    acf_lag1 = autocorr_at_lag(analysis, lag_steps=1)
+    acf_lag_tau = autocorr_at_lag(analysis, lag_steps=lag_tau_steps)
+
+    return {
+        "gamma": p.gamma,
+        "beta": p.beta,
+        "tau": p.tau,
+        "sigma": p.sigma,
+        "control_mode": p.control_mode,
+        "delay_mode": p.delay_mode,
+        "relative_spread": p.relative_spread,
+        "k_linear": p.k_linear,
+        "dt": dt,
+        "relax_time": p.relax_time(),
+        "analysis_time": p.analysis_time,
+        "relax_steps": relax_steps,
+        "analysis_steps": analysis_steps,
+        "t_corr": t_corr,
+        "chi": chi,
+        "mi_lag_tau": mi_lag_tau,
+        "acf_lag1": acf_lag1,
+        "acf_lag_tau": acf_lag_tau,
+        "x_mean": float(np.mean(analysis)),
+        "x_std": float(np.std(analysis, ddof=1)),
+        "trajectory_clipped": int(clipped_steps > 0),
+        "clipped_fraction": clipped_steps / total_steps,
+        "acf_failure_reason": acf_reason,
+    }
+
+
+# =========================================================
+# Validation
+# =========================================================
+
+def run_validation_suite(base: SimParams) -> pd.DataFrame:
+    tests: List[Dict[str, object]] = []
+
+    # 1. bounded linear no clipping
+    p1 = replace(
+        base,
+        control_mode="bounded_linear_delay",
+        delay_mode="fixed",
+        n_trials=10,
+        analysis_time=100.0,
+        tau=1.2,
+        beta=1.2,
+        sigma=0.35
+    )
+    clipped = []
+    for trial in range(p1.n_trials):
+        rng = np.random.default_rng(p1.seed + trial)
+        res = simulate_single_trial(p1, rng)
+        clipped.append(res["trajectory_clipped"])
+    clipped_fraction = float(np.mean(clipped))
+    tests.append({
+        "test": "bounded_linear_no_clipping",
+        "passed": bool(clipped_fraction == 0.0),
+        "metric": "trajectory_clipped_fraction",
+        "value": clipped_fraction,
+        "expected": 0.0
+    })
+
+    # 2. spread zero matches fixed for stochastic delay
+    p_fixed = replace(base, delay_mode="fixed", relative_spread=0.0, n_trials=6, analysis_time=80.0)
+    p_stoch = replace(base, delay_mode="stochastic_single_delay", relative_spread=0.0, n_trials=6, analysis_time=80.0)
+
+    chi_fixed = []
+    chi_stoch = []
+    for trial in range(6):
+        rng_fixed = np.random.default_rng(1000 + trial)
+        rng_stoch = np.random.default_rng(1000 + trial)
+        chi_fixed.append(simulate_single_trial(p_fixed, rng_fixed)["chi"])
+        chi_stoch.append(simulate_single_trial(p_stoch, rng_stoch)["chi"])
+
+    max_abs_diff = float(np.nanmax(np.abs(np.array(chi_fixed) - np.array(chi_stoch))))
+    tests.append({
+        "test": "spread_zero_matches_fixed",
+        "passed": bool(max_abs_diff < 1e-12),
+        "metric": "max_abs_diff_chi",
+        "value": max_abs_diff,
+        "expected": 0.0
+    })
+
+    return pd.DataFrame(tests)
+
+
+# =========================================================
+# Batch runners / summaries
+# =========================================================
+
+def run_experiment(
+    configs: List[SimParams],
+    experiment_name: str,
+    base_seed: int
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    rows = []
+
+    total = len(configs)
+    for idx, p in enumerate(configs, start=1):
+        log(
+            f"{experiment_name}: condition {idx}/{total} | "
+            f"control={p.control_mode}, delay={p.delay_mode}, gamma={p.gamma}, "
+            f"beta={p.beta}, tau={p.tau}, sigma={p.sigma}, spread={p.relative_spread}"
+        )
+
+        for trial in range(p.n_trials):
+            seed = base_seed + 1_000_000 * idx + trial
+            rng = np.random.default_rng(seed)
+            res = simulate_single_trial(p, rng)
+            res["trial"] = trial
+            res["seed_used"] = seed
+            res["condition_index"] = idx
+            res["experiment"] = experiment_name
+            rows.append(res)
+
+    raw_df = pd.DataFrame(rows)
+    summary_df = summarize_raw(raw_df)
+    return raw_df, summary_df
+
+
+def summarize_raw(raw_df: pd.DataFrame) -> pd.DataFrame:
+    group_cols = [
+        c for c in [
+            "experiment", "control_mode", "delay_mode", "gamma", "beta",
+            "tau", "sigma", "relative_spread", "k_linear"
+        ]
+        if c in raw_df.columns and raw_df[c].nunique(dropna=False) > 1
+    ]
+    if "experiment" in raw_df.columns and "experiment" not in group_cols:
+        group_cols = ["experiment"] + group_cols
+    if not group_cols:
+        group_cols = ["experiment"]
+
+    rows = []
+
+    for keys, g in raw_df.groupby(group_cols, dropna=False):
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+        row = dict(zip(group_cols, keys))
+
+        chi_vals = g["chi"].to_numpy(dtype=float)
+        tc_vals = g["t_corr"].to_numpy(dtype=float)
+        mi_vals = g["mi_lag_tau"].to_numpy(dtype=float)
+        clip_vals = g["trajectory_clipped"].to_numpy(dtype=float)
+
+        row["n"] = int(len(g))
+        row["chi_mean"] = safe_mean(chi_vals)
+        row["chi_median"] = safe_median(chi_vals)
+        row["chi_sem"] = sem(chi_vals)
+        row["chi_std"] = safe_std(chi_vals)
+        row["chi_min"] = float(np.nanmin(chi_vals)) if np.isfinite(chi_vals).any() else np.nan
+        row["chi_max"] = float(np.nanmax(chi_vals)) if np.isfinite(chi_vals).any() else np.nan
+        row["frac_chi_gt_1"] = float(np.mean(chi_vals > 1.0)) if np.isfinite(chi_vals).any() else np.nan
+
+        row["t_corr_mean"] = safe_mean(tc_vals)
+        row["t_corr_median"] = safe_median(tc_vals)
+        row["t_corr_sem"] = sem(tc_vals)
+
+        row["mi_lag_tau_mean"] = safe_mean(mi_vals)
+        row["mi_lag_tau_sem"] = sem(mi_vals)
+
+        row["trajectory_clipped_fraction"] = safe_mean(clip_vals)
+
+        reasons = g["acf_failure_reason"].fillna("missing").astype(str).value_counts()
+        row["acf_ok"] = int(reasons.get("ok", 0))
+        row["acf_never_crossed_1_over_e"] = int(reasons.get("never_crossed_1_over_e", 0))
+        row["acf_zero_variance"] = int(reasons.get("zero_variance", 0))
+        row["acf_other_failures"] = int(
+            len(g) - row["acf_ok"] - row["acf_never_crossed_1_over_e"] - row["acf_zero_variance"]
+        )
+
+        rows.append(row)
+
+    return pd.DataFrame(rows).sort_values(group_cols).reset_index(drop=True)
+
+
+def build_control_configs(base: SimParams) -> List[SimParams]:
+    configs = []
+    for control_mode in ["nonlinear_delay", "bounded_linear_delay", "no_delay"]:
+        for tau in base.tau_values:
+            configs.append(
+                replace(
+                    base,
+                    control_mode=control_mode,
+                    delay_mode="fixed",
+                    relative_spread=0.0,
+                    tau=float(tau)
+                )
+            )
+    return configs
+
+
+def build_sigma_configs(base: SimParams) -> List[SimParams]:
+    return [
+        replace(
+            base,
+            control_mode="nonlinear_delay",
+            delay_mode="fixed",
+            relative_spread=0.0,
+            sigma=float(sig)
+        )
+        for sig in base.sigma_values
+    ]
+
+
+def build_delay_dispersion_configs(base: SimParams) -> List[SimParams]:
+    return [
+        replace(
+            base,
+            control_mode="nonlinear_delay",
+            delay_mode="stochastic_single_delay",
+            relative_spread=float(rs),
+            tau=1.2,
+            beta=1.2,
+            gamma=1.0
+        )
+        for rs in base.relative_spread_values
+    ]
+
+
+# =========================================================
+# Distribution / correlation outputs
+# =========================================================
+
+CHI_BANDS = ["<=0.5", "0.5-1", "1-2", "2-5", "5-10", ">10"]
+
+
+def build_chi_distribution_table(raw_df: pd.DataFrame) -> pd.DataFrame:
+    df = raw_df.copy()
+    df["chi_band"] = pd.cut(
+        df["chi"],
+        bins=[-np.inf, 0.5, 1.0, 2.0, 5.0, 10.0, np.inf],
+        labels=CHI_BANDS,
+        include_lowest=True
+    )
+
+    cols = [
+        "experiment", "condition_index", "trial", "seed_used",
+        "control_mode", "delay_mode", "gamma", "beta", "tau", "sigma",
+        "relative_spread", "k_linear",
+        "chi", "t_corr", "mi_lag_tau", "acf_lag1", "acf_lag_tau",
+        "trajectory_clipped", "clipped_fraction", "acf_failure_reason", "chi_band"
+    ]
+    cols = [c for c in cols if c in df.columns]
+    return df[cols].sort_values(["experiment", "condition_index", "trial"]).reset_index(drop=True)
+
+
+def build_chi_distribution_counts(table_df: pd.DataFrame) -> pd.DataFrame:
+    gcols = ["experiment", "control_mode", "delay_mode", "tau", "relative_spread", "chi_band"]
+    gcols = [c for c in gcols if c in table_df.columns]
+
+    counts = table_df.groupby(gcols, dropna=False).size().reset_index(name="count")
+    denom_cols = [c for c in gcols if c != "chi_band"]
+    totals = table_df.groupby(denom_cols, dropna=False).size().reset_index(name="total")
+
+    merged = counts.merge(totals, on=denom_cols, how="left")
+    merged["fraction"] = merged["count"] / merged["total"]
+    return merged.sort_values(denom_cols + ["chi_band"]).reset_index(drop=True)
+
+
+def build_figure2_aggregated_distribution(counts_df: pd.DataFrame) -> pd.DataFrame:
+    df = counts_df.copy()
+    if "delay_mode" in df.columns:
+        df = df[df["delay_mode"] == "fixed"].copy()
+    if "control_mode" in df.columns:
+        df = df[df["control_mode"].isin(["nonlinear_delay", "bounded_linear_delay", "no_delay"])].copy()
+
+    agg = (
+        df.groupby(["control_mode", "chi_band"], dropna=False)["count"]
+        .sum()
+        .reset_index()
+    )
+    totals = agg.groupby("control_mode")["count"].sum().reset_index(name="total")
+    agg = agg.merge(totals, on="control_mode", how="left")
+    agg["fraction"] = agg["count"] / agg["total"]
+
+    # ensure complete band grid
+    rows = []
+    for control_mode in ["nonlinear_delay", "bounded_linear_delay", "no_delay"]:
+        for band in CHI_BANDS:
+            sub = agg[(agg["control_mode"] == control_mode) & (agg["chi_band"].astype(str) == band)]
+            if len(sub) == 0:
+                rows.append({"control_mode": control_mode, "chi_band": band, "count": 0, "total": np.nan, "fraction": 0.0})
+            else:
+                rows.append(sub.iloc[0].to_dict())
+
+    out = pd.DataFrame(rows)
+    out["chi_band"] = pd.Categorical(out["chi_band"], categories=CHI_BANDS, ordered=True)
+    out = out.sort_values(["control_mode", "chi_band"]).reset_index(drop=True)
+    return out
+
+
+def corr_summary(df: pd.DataFrame, labels: Dict[str, object]) -> Dict[str, object]:
+    sub = df[["chi", "mi_lag_tau"]].replace([np.inf, -np.inf], np.nan).dropna()
+    n = len(sub)
+    row = dict(labels)
+    row["n"] = n
+
+    if n < 3:
+        row["pearson_r"] = np.nan
+        row["spearman_rho"] = np.nan
+        row["pearson_ci_low"] = np.nan
+        row["pearson_ci_high"] = np.nan
+        row["chi_mean"] = np.nan
+        row["mi_mean"] = np.nan
+        return row
+
+    pearson_r = float(sub["chi"].corr(sub["mi_lag_tau"], method="pearson"))
+    spearman_rho = float(sub["chi"].corr(sub["mi_lag_tau"], method="spearman"))
+    ci_lo, ci_hi = fisher_ci(pearson_r, n)
+
+    row["pearson_r"] = pearson_r
+    row["spearman_rho"] = spearman_rho
+    row["pearson_ci_low"] = ci_lo
+    row["pearson_ci_high"] = ci_hi
+    row["chi_mean"] = float(sub["chi"].mean())
+    row["mi_mean"] = float(sub["mi_lag_tau"].mean())
+    return row
+
+
+def build_correlation_outputs(raw_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    overall = pd.DataFrame([corr_summary(raw_df, {"group_type": "overall", "group_value": "all"})])
+
+    by_control_rows = []
+    for control_mode, g in raw_df.groupby("control_mode", dropna=False):
+        by_control_rows.append(
+            corr_summary(g, {"group_type": "control_mode", "group_value": control_mode})
+        )
+    by_control = pd.DataFrame(by_control_rows).sort_values("group_value").reset_index(drop=True)
+    return overall, by_control
+
+
+# =========================================================
+# Tables / metadata
+# =========================================================
+
+def build_parameter_table(base: SimParams) -> pd.DataFrame:
+    rows = [
+        {"parameter": "gamma", "meaning": "dissipation rate", "value": base.gamma},
+        {"parameter": "beta", "meaning": "feedback gain", "value": base.beta},
+        {"parameter": "tau", "meaning": "delay", "value": base.tau},
+        {"parameter": "sigma", "meaning": "noise amplitude", "value": base.sigma},
+        {"parameter": "control_mode", "meaning": "feedback structure", "value": "nonlinear_delay / bounded_linear_delay / no_delay"},
+        {"parameter": "delay_mode", "meaning": "delay implementation", "value": "fixed / stochastic_single_delay"},
+        {"parameter": "relative_spread", "meaning": "delay std / mean delay", "value": "used for stochastic delay"},
+        {"parameter": "k_linear", "meaning": "scaling inside bounded tanh", "value": base.k_linear},
+        {"parameter": "dt", "meaning": "integration step", "value": "0.01 * min(tau, 1/gamma)"},
+        {"parameter": "initial history", "meaning": "t < 0", "value": "Gaussian history with variance sigma^2"},
+        {"parameter": "relax_time", "meaning": "burn-in duration", "value": "100 / gamma"},
+        {"parameter": "analysis_time", "meaning": "post-burn-in duration", "value": base.analysis_time},
+        {"parameter": "n_trials", "meaning": "independent realizations per condition", "value": base.n_trials},
+    ]
+    return pd.DataFrame(rows)
+
+
+def build_equation_table() -> pd.DataFrame:
+    rows = [
+        {
+            "label": "main_model",
+            "equation": "dx/dt = -gamma*x(t) + beta*f(x(t-tau)) + sigma*xi(t)",
+            "note": "stochastic delayed dynamics"
+        },
+        {
+            "label": "nonlinear_delay",
+            "equation": "f(x) = tanh(x)",
+            "note": "applied to delayed state x(t-tau)"
+        },
+        {
+            "label": "bounded_linear_delay",
+            "equation": "f(x) = tanh(k_linear*x)",
+            "note": "bounded linear-like control"
+        },
+        {
+            "label": "no_delay",
+            "equation": "f(x_now) = tanh(x_now)",
+            "note": "instantaneous feedback"
+        },
+        {
+            "label": "self_retention_index",
+            "equation": "chi = gamma * T_corr",
+            "note": "T_corr is first lag where ACF = 1/e"
+        },
+        {
+            "label": "lagged_mutual_information",
+            "equation": "MI_tau = I[x(t); x(t-tau)]",
+            "note": "binned estimate"
+        }
+    ]
+    return pd.DataFrame(rows)
+
+
+# =========================================================
+# Main
+# =========================================================
+
+def main() -> None:
+    if os.path.exists(LOGFILE):
+        os.remove(LOGFILE)
+
+    base = SimParams()
+    log(f"Output directory: {OUTDIR}")
+
+    # save config tables
+    save_csv(build_parameter_table(base), "parameter_table.csv")
+    save_csv(build_equation_table(), "equation_table.csv")
+    save_json(base.to_serializable_dict(), "run_config.json")
+
+    # validation
+    log("Running validation suite")
+    validation_df = run_validation_suite(base)
+    save_csv(validation_df, "validation_report.csv")
+    save_json({"validation": validation_df.to_dict(orient="records")}, "validation_report.json")
+
+    # core experiment: control comparison
+    log("Running control comparison")
+    control_raw, control_summary = run_experiment(
+        configs=build_control_configs(base),
+        experiment_name="control_comparison",
+        base_seed=100_000
+    )
+    save_csv(control_raw, "control_comparison_raw.csv")
+    save_csv(control_summary, "control_comparison_summary.csv")
+
+    # figure 1 left panel data
+    fig1_left = control_summary[
+        control_summary["control_mode"].isin(["nonlinear_delay", "bounded_linear_delay", "no_delay"])
+    ].copy()
+    save_csv(fig1_left, "figure1_left_panel_data.csv")
+
+    # figure 1 right / figure 3 scatter data
+    fig_scatter = control_raw[
+        [
+            "trial", "seed_used", "control_mode", "tau", "gamma", "beta", "sigma",
+            "chi", "mi_lag_tau", "t_corr", "trajectory_clipped", "acf_failure_reason"
+        ]
+    ].copy()
+    save_csv(fig_scatter, "figure_scatter_data.csv")
+
+    # chi distribution outputs
+    log("Building chi distribution outputs")
+    chi_table = build_chi_distribution_table(control_raw)
+    chi_counts = build_chi_distribution_counts(chi_table)
+    fig2_data = build_figure2_aggregated_distribution(chi_counts)
+
+    save_csv(chi_table, "chi_distribution_table.csv")
+    save_csv(chi_counts, "chi_distribution_counts.csv")
+    save_csv(fig2_data, "figure2_distribution_data.csv")
+
+    # correlation outputs
+    log("Building correlation outputs")
+    corr_overall, corr_by_control = build_correlation_outputs(control_raw)
+    save_csv(corr_overall, "chi_mi_correlation_overall.csv")
+    save_csv(corr_by_control, "chi_mi_correlation_by_control.csv")
+
+    # sigma sweep
+    log("Running sigma sweep")
+    sigma_raw, sigma_summary = run_experiment(
+        configs=build_sigma_configs(base),
+        experiment_name="sigma_sweep",
+        base_seed=200_000
+    )
+    save_csv(sigma_raw, "sigma_sweep_raw.csv")
+    save_csv(sigma_summary, "sigma_sweep_summary.csv")
+
+    # delay-dispersion sweep
+    log("Running delay dispersion sweep")
+    disp_raw, disp_summary = run_experiment(
+        configs=build_delay_dispersion_configs(base),
+        experiment_name="delay_dispersion_sweep",
+        base_seed=300_000
+    )
+    save_csv(disp_raw, "delay_dispersion_raw.csv")
+    save_csv(disp_summary, "delay_dispersion_summary.csv")
+
+    # manuscript-ready summary table
+    summary_rows = []
+
+    # example tau = 1.20
+    for control_mode in ["nonlinear_delay", "bounded_linear_delay", "no_delay"]:
+        sub = control_summary[
+            (control_summary["control_mode"] == control_mode)
+            & (np.isclose(control_summary["tau"], 1.20))
+        ]
+        if len(sub):
+            r = sub.iloc[0]
+            summary_rows.append({
+                "section": "Results 3.2 example at tau=1.20",
+                "group": control_mode,
+                "chi_mean": r["chi_mean"],
+                "chi_sem": r["chi_sem"],
+                "frac_chi_gt_1": r["frac_chi_gt_1"]
+            })
+
+    # figure 2 distribution peak bands
+    for control_mode in ["nonlinear_delay", "bounded_linear_delay", "no_delay"]:
+        sub = fig2_data[fig2_data["control_mode"] == control_mode].copy()
+        if len(sub):
+            peak = sub.sort_values("fraction", ascending=False).iloc[0]
+            summary_rows.append({
+                "section": "Results 3.3 dominant band",
+                "group": control_mode,
+                "chi_band": peak["chi_band"],
+                "fraction": peak["fraction"]
+            })
+
+    # correlations
+    for _, r in corr_by_control.iterrows():
+        summary_rows.append({
+            "section": "Results 3.4 correlations",
+            "group": r["group_value"],
+            "pearson_r": r["pearson_r"],
+            "pearson_ci_low": r["pearson_ci_low"],
+            "pearson_ci_high": r["pearson_ci_high"],
+            "spearman_rho": r["spearman_rho"],
+            "n": r["n"]
+        })
+
+    save_csv(pd.DataFrame(summary_rows), "manuscript_ready_summary_table.csv")
+
+    # master file list
+    created = [
+        "parameter_table.csv",
+        "equation_table.csv",
+        "run_config.json",
+        "validation_report.csv",
+        "validation_report.json",
+        "control_comparison_raw.csv",
+        "control_comparison_summary.csv",
+        "figure1_left_panel_data.csv",
+        "figure_scatter_data.csv",
+        "chi_distribution_table.csv",
+        "chi_distribution_counts.csv",
+        "figure2_distribution_data.csv",
+        "chi_mi_correlation_overall.csv",
+        "chi_mi_correlation_by_control.csv",
+        "sigma_sweep_raw.csv",
+        "sigma_sweep_summary.csv",
+        "delay_dispersion_raw.csv",
+        "delay_dispersion_summary.csv",
+        "manuscript_ready_summary_table.csv",
+        "run_log.txt"
+    ]
+    save_csv(pd.DataFrame({"filename": created}), "created_files_index.csv")
+
+    log("Completed all analyses")
+    for fn in created:
+        log(f" - {os.path.join(OUTDIR, fn)}")
+
+
+if __name__ == "__main__":
+    main()
